@@ -1,0 +1,110 @@
+#!/usr/bin/env python3
+"""Small stdlib-only HiveOS stats adapter for the Vela miner's structured log."""
+import csv
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from collections import deque
+
+log_path = sys.argv[1] if len(sys.argv) > 1 else "/hive-config/vela-custom-hive/logs/vela-miner.log"
+custom_name = sys.argv[2] if len(sys.argv) > 2 else "vela-custom-hive"
+algo = sys.argv[3] if len(sys.argv) > 3 else "vela"
+latest_progress = None
+accepted = rejected = 0
+start_ts = None
+try:
+    with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if start_ts is None and ("miner_start " in line or "stratum_mode_enabled " in line):
+                start_ts = line[:23]
+            if "mining_progress payload=2 " in line:
+                latest_progress = line.strip()
+            if "submit_result payload=2 " in line:
+                m = re.search(r"result=([^\s]+)", line)
+                if m:
+                    if m.group(1) == "accepted_by_rpc":
+                        accepted += 1
+                    else:
+                        rejected += 1
+            if "share_accepted accepted=" in line:
+                m = re.search(r"share_accepted accepted=(\d+)", line)
+                if m:
+                    accepted = max(accepted, int(m.group(1)))
+            if "share_rejected error=" in line:
+                m = re.search(r"rejected=(\d+)", line)
+                if m:
+                    rejected = max(rejected, int(m.group(1)))
+            if "stratum_miner_stopped accepted=" in line:
+                m = re.search(r"accepted=(\d+) rejected=(\d+)", line)
+                if m:
+                    accepted = max(accepted, int(m.group(1)))
+                    rejected = max(rejected, int(m.group(2)))
+except OSError:
+    pass
+
+rates = {}
+aggregate = 0.0
+if latest_progress:
+    m = re.search(r"inf_per_second=([0-9.]+)", latest_progress)
+    if m:
+        aggregate = float(m.group(1))
+    per_gpu = latest_progress.split(" per_gpu=", 1)[-1]
+    for device, value in re.findall(r"(cuda:\d+):[^;\s]*?inf_s=([0-9.]+)", per_gpu):
+        rates[int(device.split(":", 1)[1])] = float(value)
+
+# CUDA order is aligned with nvidia-smi's PCI_BUS_ID order (set by h-run.sh).
+gpus = []
+try:
+    raw = subprocess.check_output([
+        "nvidia-smi", "--query-gpu=index,temperature.gpu,fan.speed,pci.bus_id",
+        "--format=csv,noheader,nounits"
+    ], text=True, stderr=subprocess.DEVNULL, timeout=2)
+    for row in csv.reader(raw.splitlines(), skipinitialspace=True):
+        if len(row) < 4:
+            continue
+        idx = int(row[0])
+        temp = int(float(row[1])) if row[1].strip().replace('.', '', 1).isdigit() else 0
+        fan = int(float(row[2])) if row[2].strip().replace('.', '', 1).isdigit() else 0
+        bus_hex = row[3].strip().split(":")[-2] if ":" in row[3] else "0"
+        try:
+            bus = int(bus_hex, 16)
+        except ValueError:
+            bus = 0
+        gpus.append((idx, temp, fan, bus))
+except Exception:
+    pass
+
+gpus.sort(key=lambda x: x[0])
+hs = [rates.get(i, 0.0) for i, *_ in gpus]
+temp = [t for _, t, _, _ in gpus]
+fan = [f for _, _, f, _ in gpus]
+bus = [b for *_, b in gpus]
+# If GPU enumeration is temporarily unavailable, keep the aggregate visible rather than inventing per-card rates.
+if not hs and aggregate > 0:
+    hs = [aggregate]
+    temp, fan, bus = [0], [0], [0]
+
+uptime = 0
+if start_ts:
+    try:
+        from datetime import datetime
+        dt = datetime.strptime(start_ts, "%Y-%m-%d %H:%M:%S.%f")
+        uptime = max(0, int(time.time() - dt.timestamp()))
+    except Exception:
+        pass
+
+stats = {
+    "hs": hs,
+    "hs_units": "hs",
+    "temp": temp,
+    "fan": fan,
+    "uptime": uptime,
+    "ver": "0.2.0",
+    "ar": [accepted, rejected],
+    "algo": algo,
+    "bus_numbers": bus,
+}
+print(json.dumps({"khs": aggregate / 1000.0, "stats": stats}, separators=(",", ":")))

@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Sourced by HiveOS. $khs is in kH/s; $stats is the standard HiveOS JSON object.
+_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+. "$_DIR/h-manifest.conf"
+_STATE_LOG=/hive-config/vela-custom-hive/logs/vela-miner.log
+_json=$(python3 "$_DIR/h-stats.py" "$_STATE_LOG" "$CUSTOM_NAME" "$CUSTOM_ALGO" 2>/dev/null)
+if [[ -n "$_json" ]] && command -v jq >/dev/null 2>&1 && jq -e '.stats' >/dev/null 2>&1 <<< "$_json"; then
+  khs=$(jq -r '.khs // 0' <<< "$_json")
+  stats=$(jq -c '.stats' <<< "$_json")
+else
+  khs=0
+  stats=null
+fi
